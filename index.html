@@ -975,6 +975,15 @@ body {
               <button type="button" class="seg-btn" role="radio" data-val="quick">Quick</button>
             </div>
           </div>
+          <div class="row">
+            <span class="row-label">Steering assist</span>
+            <div class="seg" role="radiogroup" aria-label="Steering assist" data-key="steerAssist">
+              <button type="button" class="seg-btn" role="radio" data-val="off">Off</button>
+              <button type="button" class="seg-btn" role="radio" data-val="medium">Medium</button>
+              <button type="button" class="seg-btn" role="radio" data-val="strong">Strong</button>
+            </div>
+            <p id="steerAssistNote" class="row-note"></p>
+          </div>
           <div class="row" id="rowCentre" hidden>
             <span class="row-label">Straight ahead</span>
             <div class="centre">
@@ -1014,6 +1023,14 @@ body {
             </div>
             <p id="limitsNote" class="row-note"></p>
           </div>
+          <div class="row">
+            <span class="row-label">Racing line</span>
+            <div class="seg" role="radiogroup" aria-label="Racing line" data-key="line">
+              <button type="button" class="seg-btn" role="radio" data-val="full">Full</button>
+              <button type="button" class="seg-btn" role="radio" data-val="corners">Corners</button>
+              <button type="button" class="seg-btn" role="radio" data-val="off">Off</button>
+            </div>
+          </div>
           <div class="row" id="rowScreen" hidden>
             <span class="row-label">Screen</span>
             <div class="seg" role="radiogroup" aria-label="Screen orientation" data-key="screen">
@@ -1023,7 +1040,6 @@ body {
             </div>
           </div>
           <div class="toggles" role="group" aria-label="Options">
-            <button id="tLine" class="toggle" type="button" aria-pressed="true">Racing line</button>
             <button id="tGhost" class="toggle" type="button" aria-pressed="true">Ghost</button>
             <button id="tSound" class="toggle" type="button" aria-pressed="true">Sound</button>
           </div>
@@ -1109,10 +1125,14 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     wheelOffset: 0.8,     // lateral wheel position used for surface sampling, m
   };
 
-  // surfaces: 0 asphalt, 1 kerb, 2 grass, 3 gravel
-  const SURF_MU = [1.0, 1.0, 0.55, 0.45];
-  const SURF_DRAG_A = [0, 0, 1.6, 5.0];      // m/s^2 constant resistance
-  const SURF_DRAG_B = [0, 0, 0.025, 0.05];   // m/s^2 per m/s
+  // surfaces: 0 asphalt, 1 kerb, 2 grass, 3 gravel, 4 painted run-off (the green-painted asphalt band behind
+  // the kerbs: a little less grip than the track, hardly any drag). v6: grass and gravel are kinder, so a
+  // mistake costs time without stopping the car.
+  const SURF_MU = [1.0, 1.0, 0.72, 0.52, 0.9];
+  const SURF_DRAG_A = [0, 0, 0.6, 3.2, 0.25];     // m/s^2 constant resistance
+  const SURF_DRAG_B = [0, 0, 0.010, 0.03, 0.003]; // m/s^2 per m/s
+  const PAINT_W = 2.4;                            // painted band reaches this far past the kerb's outer edge, m
+  const isRough = (s) => s === 2 || s === 3;      // grass or gravel: dust, rumble, shaking
 
   // gearbox (display + sound): top speed of each gear at 12,500 rpm, km/h
   const GEAR_TOP = [95, 132, 166, 199, 232, 265, 299, 336];
@@ -1364,6 +1384,8 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
       const left = n > 0;
       if (a <= this.hw + this.kerbW && (left ? this.kerbL[i] : this.kerbR[i])) return 1;
       if (a >= this.hw + this.kerbW + 1.0 && (left ? this.gravL[i] : this.gravR[i])) return 3;
+      // the painted band ends 0.8 m before the barrier where the run-off is narrow (the same edge the game draws)
+      if (a <= Math.min(this.hw + this.kerbW + PAINT_W, (left ? this.barL[i] : this.barR[i]) - 0.8)) return 4;
       return 2;
     }
 
@@ -1873,7 +1895,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     }
   }
 
-  const api = { PARAMS, SURF_MU, GEAR_TOP, RPM_MAX, RPM_IDLE, Track, Car, LapTimer, LimitsJudge, Autopilot, clamp, limits, mf, invMF };
+  const api = { PARAMS, SURF_MU, SURF_DRAG_A, SURF_DRAG_B, PAINT_W, isRough, GEAR_TOP, RPM_MAX, RPM_IDLE, Track, Car, LapTimer, LimitsJudge, Autopilot, clamp, limits, mf, invMF };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.FL = api;
 })(typeof self !== 'undefined' ? self : this);
@@ -1909,18 +1931,28 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
 
   // ------------------------------------------------------------------ simulation
   const track = new FL.Track(DATA);
-  const car = new FL.Car(track);
+  // the player's car gets its own copy of the parameters: the steering slew is quicker with tilt
+  const car = new FL.Car(track, Object.assign({}, FL.PARAMS));
+  const STEER_RATE_TOUCH = FL.PARAMS.steerRate, STEER_RATE_TILT = 10;
   const timer = new FL.LapTimer(track);
   const judge = new FL.LimitsJudge(track, 'relaxed');
   const pilot = new FL.Autopilot(track);
+  const assistPilot = new FL.Autopilot(track);   // the ideal steering for the steering assist
   const SPAWN_BACK = 260;
-  const settings = { steer: 'tilt', sens: 'normal', limits: 'relaxed', screen: 'auto', line: true, ghost: true, sound: true, cam: 'chase', tiltOffset: 0, assist: 'off', level: 'easy', pedals: 'slide' };
+  const settings = { steer: 'tilt', sens: 'normal', limits: 'relaxed', screen: 'auto', line: 'corners', ghost: true, sound: true, cam: 'chase', tiltOffset: 0, assist: 'off', steerAssist: 'medium', level: 'easy', pedals: 'slide' };
   // touch steering: drag distance for full lock (share of screen width) and response curve
   // (v5: the old Quick is the new Normal, the old Normal the new Calm)
   const TOUCH_PRESETS = { calm: { r: 0.056, expo: 1.15 }, normal: { r: 0.042, expo: 1.0 }, quick: { r: 0.034, expo: 0.95 } };
   // tilt steering: how far the phone is turned for full lock (degrees) and response curve
-  const TILT_PRESETS = { calm: { range: 25, expo: 1.15 }, normal: { range: 18, expo: 1.05 }, quick: { range: 13.5, expo: 1.0 } };
+  // (v6: about 40% more sensitive. Normal was 18 degrees, so a corner at the limit took about 14 degrees of turn)
+  const TILT_PRESETS = { calm: { range: 15, expo: 1.15 }, normal: { range: 11, expo: 1.1 }, quick: { range: 8.5, expo: 1.15 } };
+  // steering assist: share of the gap to the ideal steering (the computer driver's) that is closed for you
+  const STEER_ASSIST = { off: 0, medium: 0.4, strong: 0.55 };
+  const LINE_MODES = ['full', 'corners', 'off'];
   const CAMS = ['chase', 'near', 'tcam'];
+  // how bad each surface is, for picking the worse of the two wheels: asphalt, kerb, painted run-off, grass, gravel
+  const SURF_RANK = [0, 1, 3, 4, 2];
+  const worstSurf = (a, b) => (SURF_RANK[a] >= SURF_RANK[b] ? a : b);
   let mode = 'title';            // title | ready | drive | flash | pause
   let assistThrottle = false;    // holds the throttle on the run-up until the player touches a pedal
 
@@ -1939,21 +1971,21 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   renderer.setPixelRatio(pixelRatio);
   renderer.outputEncoding = THREE.sRGBEncoding;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.12;
+  renderer.toneMappingExposure = 1.04;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFShadowMap;
   const maxAniso = renderer.capabilities.getMaxAnisotropy ? renderer.capabilities.getMaxAnisotropy() : 1;
 
-  const SKY_TOP = C(0x2a62ae), SKY_MID = C(0x6aa1d6), SKY_HZ = C(0xcddbe5);
+  const SKY_TOP = C(0x1c51a6), SKY_MID = C(0x5590d0), SKY_HZ = C(0xc3d5e3);
   const scene = new THREE.Scene();
   scene.background = SKY_HZ.clone();
   scene.fog = new THREE.Fog(SKY_HZ.clone(), 330, 2500);
   const camera = new THREE.PerspectiveCamera(60, 1, 0.3, 4600);
 
-  scene.add(new THREE.HemisphereLight(C(0xd6e6ff), C(0x56623f), 0.9));
+  scene.add(new THREE.HemisphereLight(C(0xd3e2fa), C(0x4f5a3a), 0.74));
   // afternoon sun, about 40 degrees up: longer shadows and warmer light
   const SUN_DIR = new THREE.Vector3(-0.537, 0.64, 0.549).normalize();
-  const sun = new THREE.DirectionalLight(C(0xffe9cc), 1.6);
+  const sun = new THREE.DirectionalLight(C(0xffe8c8), 1.95);
   sun.castShadow = true;
   sun.shadow.mapSize.set(1024, 1024);
   Object.assign(sun.shadow.camera, { left: -8, right: 8, top: 8, bottom: -8, near: 20, far: 160 });
@@ -1996,29 +2028,51 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   const SANS = '"Barlow Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif';
   const TEX = {
     asphalt: canvasTex(512, 512, (g, w, h) => {
-      g.fillStyle = '#45494f'; g.fillRect(0, 0, w, h);
-      for (let k = 0; k < 70; k++) {
-        g.fillStyle = rnd() < 0.55 ? 'rgba(28,30,34,0.10)' : 'rgba(130,134,140,0.06)';
-        g.beginPath(); g.ellipse(rnd() * w, rnd() * h, 10 + rnd() * 50, 8 + rnd() * 40, rnd() * 3, 0, 7); g.fill();
+      g.fillStyle = '#3b3d41'; g.fillRect(0, 0, w, h);
+      // faint patches of newer and older surface
+      for (let k = 0; k < 44; k++) {
+        g.fillStyle = rnd() < 0.5 ? 'rgba(18,19,22,0.08)' : 'rgba(118,120,124,0.05)';
+        g.beginPath(); g.ellipse(rnd() * w, rnd() * h, 18 + rnd() * 60, 12 + rnd() * 44, rnd() * 3, 0, 7); g.fill();
       }
-      grain(g, w, h, 38);
-      for (let k = 0; k < 2600; k++) { g.fillStyle = rnd() < 0.5 ? 'rgba(200,204,210,0.35)' : 'rgba(10,10,12,0.4)'; g.fillRect(rnd() * w, rnd() * h, 1.5, 1.5); }
-      g.strokeStyle = 'rgba(25,27,30,0.08)'; g.lineWidth = 3;
-      for (let k = 0; k < 14; k++) { const x = rnd() * w; g.beginPath(); g.moveTo(x, 0); g.lineTo(x + (rnd() - 0.5) * 20, h); g.stroke(); }
+      grain(g, w, h, 30);
+      // aggregate: pale stones, dark pores and a few warm chips
+      for (let k = 0; k < 5600; k++) {
+        const r = rnd(), sz = 0.8 + rnd() * 1.5;
+        g.fillStyle = r < 0.42 ? `rgba(182,184,188,${(0.22 + rnd() * 0.3).toFixed(2)})` : r < 0.9 ? 'rgba(10,10,12,0.45)' : 'rgba(150,138,122,0.35)';
+        g.fillRect(rnd() * w, rnd() * h, sz, sz);
+      }
+      // sealed cracks running along the track
+      g.strokeStyle = 'rgba(16,17,20,0.2)'; g.lineWidth = 2;
+      for (let k = 0; k < 6; k++) {
+        let x = rnd() * w, y = 0; g.beginPath(); g.moveTo(x, y);
+        while (y < h) { x += (rnd() - 0.5) * 12; y += 10 + rnd() * 22; g.lineTo(x, y); }
+        g.stroke();
+      }
     }),
     grass: canvasTex(512, 512, (g, w, h) => {
-      for (let k = 0; k < 8; k++) { g.fillStyle = k % 2 ? '#5b8a3a' : '#679845'; g.fillRect((k * w) / 8, 0, w / 8, h); }
-      for (let k = 0; k < 90; k++) { g.fillStyle = rnd() < 0.5 ? 'rgba(40,70,20,0.10)' : 'rgba(150,170,90,0.08)'; g.beginPath(); g.ellipse(rnd() * w, rnd() * h, 6 + rnd() * 30, 6 + rnd() * 30, 0, 0, 7); g.fill(); }
-      grain(g, w, h, 26, [0, 3, 0]);
+      for (let k = 0; k < 12; k++) { g.fillStyle = k % 2 ? '#486b31' : '#53773a'; g.fillRect((k * w) / 12, 0, w / 12 + 1, h); }
+      for (let k = 0; k < 120; k++) { g.fillStyle = rnd() < 0.5 ? 'rgba(32,58,18,0.10)' : 'rgba(150,160,90,0.08)'; g.beginPath(); g.ellipse(rnd() * w, rnd() * h, 6 + rnd() * 30, 6 + rnd() * 30, 0, 0, 7); g.fill(); }
+      // blades
+      for (let k = 0; k < 9000; k++) { g.fillStyle = rnd() < 0.5 ? 'rgba(28,52,16,0.32)' : 'rgba(138,168,88,0.26)'; g.fillRect(rnd() * w, rnd() * h, 1, 2 + rnd() * 3); }
+      grain(g, w, h, 16, [0, 2, 0]);
     }),
     gravel: canvasTex(256, 256, (g, w, h) => {
       g.fillStyle = '#c9b38c'; g.fillRect(0, 0, w, h); grain(g, w, h, 70);
       for (let k = 0; k < 900; k++) { g.fillStyle = rnd() < 0.5 ? 'rgba(255,250,235,0.5)' : 'rgba(90,75,55,0.45)'; g.fillRect(rnd() * w, rnd() * h, 2, 2); }
     }),
-    kerb: canvasTex(16, 128, (g, w, h) => {
-      g.fillStyle = '#c4121b'; g.fillRect(0, 0, w, h / 2);
-      g.fillStyle = '#f1f1ec'; g.fillRect(0, h / 2, w, h / 2);
-      g.fillStyle = 'rgba(0,0,0,0.12)'; g.fillRect(0, h / 2 - 2, w, 2); g.fillRect(0, h - 2, w, 2);
+    kerb: canvasTex(128, 512, (g, w, h) => {
+      g.fillStyle = '#c6141c'; g.fillRect(0, 0, w, h / 2);
+      g.fillStyle = '#ecece6'; g.fillRect(0, h / 2, w, h / 2);
+      // the joint between blocks and the light lip of each one
+      g.fillStyle = 'rgba(0,0,0,0.22)'; g.fillRect(0, h / 2 - 5, w, 5); g.fillRect(0, h - 5, w, 5);
+      g.fillStyle = 'rgba(255,255,255,0.14)'; g.fillRect(0, 0, w, 5); g.fillRect(0, h / 2, w, 5);
+      grain(g, w, h, 12);
+      // rubber laid down by cars using the kerb: soft streaks built from many faint strokes
+      for (let k = 0; k < 90; k++) {
+        const x = rnd() * w, y = rnd() * h, len = 20 + rnd() * 90, wd = 3 + rnd() * 10, a = 0.025 + rnd() * 0.05;
+        for (let m = 0; m < 4; m++) { g.fillStyle = `rgba(22,22,24,${a.toFixed(3)})`; g.fillRect(x - m, y - m * 2, wd + m * 2, len + m * 4); }
+      }
+      for (let k = 0; k < 1400; k++) { g.fillStyle = rnd() < 0.5 ? 'rgba(0,0,0,0.18)' : 'rgba(255,255,255,0.14)'; g.fillRect(rnd() * w, rnd() * h, 1, 1); }
     }),
     banners: canvasTex(2048, 128, (g, w, h) => {
       const designs = [
@@ -2156,11 +2210,53 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     grain(g, w, h, 40);
   }, { srgb: false });
   // painted run-off behind the kerbs
-  TEX.verge = canvasTex(128, 128, (g, w, h) => {
-    g.fillStyle = '#3f8f45'; g.fillRect(0, 0, w, h);
-    for (let k = 0; k < 4; k++) { g.fillStyle = k % 2 ? 'rgba(255,255,255,0.035)' : 'rgba(0,0,0,0.03)'; g.fillRect(0, (k * h) / 4, w, h / 4); }
-    grain(g, w, h, 22, [0, 4, 0]);
+  TEX.verge = canvasTex(256, 256, (g, w, h) => {
+    g.fillStyle = '#2a5233'; g.fillRect(0, 0, w, h);
+    grain(g, w, h, 16, [0, 2, 0]);
+    // the asphalt grain shows through the paint
+    for (let k = 0; k < 2200; k++) { g.fillStyle = rnd() < 0.55 ? 'rgba(8,24,12,0.35)' : 'rgba(120,170,124,0.16)'; g.fillRect(rnd() * w, rnd() * h, 1.3, 1.3); }
+    // tyre marks of cars that ran wide
+    for (let k = 0; k < 5; k++) {
+      g.strokeStyle = 'rgba(14,18,15,0.16)'; g.lineWidth = 6 + rnd() * 8; const x = rnd() * w;
+      g.beginPath(); g.moveTo(x, 0); g.bezierCurveTo(x + (rnd() - 0.5) * 60, h * 0.3, x + (rnd() - 0.5) * 60, h * 0.6, x + (rnd() - 0.5) * 40, h); g.stroke();
+    }
   });
+  // white lines: paint with grain and a little rubber
+  TEX.paint = canvasTex(64, 128, (g, w, h) => {
+    g.fillStyle = '#f2f2ef'; g.fillRect(0, 0, w, h);
+    grain(g, w, h, 18);
+    for (let k = 0; k < 40; k++) { g.fillStyle = `rgba(30,30,32,${(0.05 + rnd() * 0.12).toFixed(2)})`; g.fillRect(rnd() * w, rnd() * h, 2 + rnd() * 10, 3 + rnd() * 14); }
+  });
+  // marbles: bits of rubber swept off the line, collecting outside it in the corners (alpha, green channel)
+  TEX.marbles = canvasTex(128, 128, (g, w, h) => {
+    g.fillStyle = 'rgb(58,58,58)'; g.fillRect(0, 0, w, h);                 // a dusting all over
+    for (let k = 0; k < 120; k++) {                                          // clumps of rubber
+      const cx = rnd() * w, cy = rnd() * h, n = 4 + ((rnd() * 10) | 0);
+      for (let m = 0; m < n; m++) { const v = Math.round(150 + rnd() * 105); g.fillStyle = `rgb(${v},${v},${v})`; g.beginPath(); g.arc(cx + (rnd() - 0.5) * 9, cy + (rnd() - 0.5) * 9, 0.8 + rnd() * 1.8, 0, 7); g.fill(); }
+    }
+    for (let k = 0; k < 700; k++) { const v = Math.round(110 + rnd() * 145); g.fillStyle = `rgb(${v},${v},${v})`; g.fillRect(rnd() * w, rnd() * h, 1.2, 1.2); }
+  }, { srgb: false });
+  // energy-absorbing barrier blocks in front of the tyre walls at the big stops
+  TEX.tecpro = canvasTex(256, 64, (g, w, h) => {
+    const cols = ['#1f4db0', '#e9eaeb', '#d22b2b', '#e9eaeb'];
+    for (let k = 0; k < 4; k++) {
+      const x = k * 64;
+      g.fillStyle = cols[k]; g.fillRect(x, 0, 64, h);
+      const gr = g.createLinearGradient(x, 0, x + 64, 0);
+      gr.addColorStop(0, 'rgba(0,0,0,0.28)'); gr.addColorStop(0.14, 'rgba(0,0,0,0)'); gr.addColorStop(0.86, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,0.32)');
+      g.fillStyle = gr; g.fillRect(x, 0, 64, h);
+      g.fillStyle = 'rgba(255,255,255,0.2)'; g.fillRect(x, 0, 64, 4);
+      g.fillStyle = 'rgba(40,32,24,0.22)'; g.fillRect(x, h - 7, 64, 7);
+    }
+    grain(g, w, h, 14);
+  });
+  // the car's number, for the nose and the rear wing endplates
+  TEX.number = canvasTex(128, 128, (g, w, h) => {
+    g.clearRect(0, 0, w, h);
+    g.font = `800 112px ${SANS}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.lineJoin = 'round'; g.lineWidth = 12; g.strokeStyle = '#111316'; g.strokeText('7', w / 2, h / 2 + 6);
+    g.fillStyle = '#ffffff'; g.fillText('7', w / 2, h / 2 + 6);
+  }, { repeat: false });
   // soft darkening at the foot of walls, as alpha maps across the ribbon (inner edge clear, wall end dark)
   const aoTex = (rev) => canvasTex(64, 4, (g, w, h) => {
     const gr = g.createLinearGradient(0, 0, w, 0);
@@ -2231,33 +2327,84 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   }, { repeat: false });
   TEX.people.wrapS = TEX.people.wrapT = THREE.ClampToEdgeWrapping;
 
-  // ---- painted trees: conifer, broadleaf, poplar, bushy (128 x 256 px each)
-  TEX.trees = canvasTex(512, 256, (g) => {
+  // ---- painted trees: conifer, broadleaf, poplar, bushy (256 x 512 px each)
+  // v6: leaves are painted as thousands of small clusters, dark inside the crown and lit on the sun side,
+  // with a few gaps and branches showing, instead of a handful of big flat blobs
+  TEX.trees = canvasTex(1024, 512, (g) => {
     const tr = makeRng(9090);
-    const blob = (x, y, r, c) => { g.fillStyle = c; g.beginPath(); g.arc(x, y, r, 0, 7); g.fill(); };
-    const greens = (dark) => ['#1f3a1c', '#2b4d24', '#36602b', '#457538', '#5a8a45'].slice(dark ? 0 : 1, dark ? 4 : 5);
-    for (let t = 0; t < 4; t++) {
-      const x0 = t * 128, cx = x0 + 64;
-      // trunk
-      g.fillStyle = '#4a3a2b'; g.fillRect(cx - 4, 170, 8, 86);
-      g.fillStyle = '#35291f'; g.fillRect(cx, 170, 4, 86);
-      const pal = greens(t === 0);
-      if (t === 0) {
-        // conifer: stacked tiers, lighter on the sun side
-        for (let k = 0; k < 7; k++) {
-          const yb = 220 - k * 27, half = 54 - k * 7;
-          g.fillStyle = pal[k % 2]; g.beginPath(); g.moveTo(cx - half, yb); g.lineTo(cx, yb - 52); g.lineTo(cx + half, yb); g.closePath(); g.fill();
-          g.fillStyle = 'rgba(140,190,110,0.18)'; g.beginPath(); g.moveTo(cx - half, yb); g.lineTo(cx, yb - 52); g.lineTo(cx - half * 0.2, yb); g.closePath(); g.fill();
-        }
-      } else {
-        const rx = t === 2 ? 26 : t === 3 ? 58 : 48, ry = t === 2 ? 100 : t === 3 ? 62 : 76, cy = t === 2 ? 120 : t === 3 ? 160 : 112;
-        for (let k = 0; k < 140; k++) {
-          const a = tr() * Math.PI * 2, d = Math.sqrt(tr());
-          const x = cx + Math.cos(a) * rx * d, y = cy + Math.sin(a) * ry * d;
-          const light = clamp(0.5 - (x - cx) / (rx * 2.2) - (y - cy) / (ry * 2.6) + (tr() - 0.5) * 0.4, 0, 0.999);
-          blob(x, y, 9 + tr() * 12, pal[Math.floor(light * pal.length)]);
-        }
+    const PAL = [[24, 44, 22], [33, 60, 28], [45, 78, 35], [62, 98, 44], [86, 122, 58], [116, 148, 76]];
+    const col = (l, a = 1) => {
+      const f = clamp(l, 0, 0.999) * (PAL.length - 1), i = Math.floor(f), t = f - i, a0 = PAL[i], a1 = PAL[Math.min(i + 1, PAL.length - 1)];
+      const j = (tr() - 0.5) * 14;
+      return `rgba(${Math.round(a0[0] + (a1[0] - a0[0]) * t + j)},${Math.round(a0[1] + (a1[1] - a0[1]) * t + j)},${Math.round(a0[2] + (a1[2] - a0[2]) * t + j * 0.5)},${a})`;
+    };
+    // a crown: several overlapping lobes; clusters drawn from dark (deep inside) to light (outer, sun side)
+    function crown(cx, cy, rx, ry, lobes, count) {
+      const L = [];
+      for (let k = 0; k < lobes; k++) {
+        const a = tr() * Math.PI * 2, d = Math.sqrt(tr()) * 0.55;
+        L.push([cx + Math.cos(a) * rx * d, cy + Math.sin(a) * ry * d * 0.9, rx * (0.45 + tr() * 0.25), ry * (0.4 + tr() * 0.22)]);
       }
+      L.push([cx, cy, rx * 0.8, ry * 0.8]);
+      const pts = [];
+      for (let k = 0; k < count; k++) {
+        const lb = L[(tr() * L.length) | 0];
+        const a = tr() * Math.PI * 2, d = Math.pow(tr(), 0.6);
+        const x = lb[0] + Math.cos(a) * lb[2] * d, y = lb[1] + Math.sin(a) * lb[3] * d;
+        const ex = (x - cx) / rx, ey = (y - cy) / ry, r = Math.hypot(ex, ey);
+        // light from the upper left, darker towards the middle and the bottom of the crown
+        const light = 0.5 - ex * 0.32 - ey * 0.38 + (r - 0.55) * 0.35 + (tr() - 0.5) * 0.3;
+        pts.push([x, y, light]);
+      }
+      pts.sort((p, q) => p[2] - q[2]);
+      for (const [x, y, light] of pts) {
+        const n = 3 + ((tr() * 4) | 0), rr = 2.2 + tr() * 3.4;
+        g.fillStyle = col(light);
+        for (let k = 0; k < n; k++) { g.beginPath(); g.arc(x + (tr() - 0.5) * rr * 2.2, y + (tr() - 0.5) * rr * 2.2, rr * (0.55 + tr() * 0.6), 0, 7); g.fill(); }
+      }
+    }
+    function trunk(cx, top, bottom, wTop, wBot) {
+      const gr = g.createLinearGradient(cx - wBot, 0, cx + wBot, 0);
+      gr.addColorStop(0, '#5c4a39'); gr.addColorStop(0.55, '#3d3127'); gr.addColorStop(1, '#2a221b');
+      g.fillStyle = gr; g.beginPath(); g.moveTo(cx - wTop, top); g.lineTo(cx + wTop, top); g.lineTo(cx + wBot, bottom); g.lineTo(cx - wBot, bottom); g.closePath(); g.fill();
+    }
+    function branches(cx, y0, n, len) {
+      g.strokeStyle = '#3a2f25'; g.lineCap = 'round';
+      for (let k = 0; k < n; k++) {
+        const a = -Math.PI / 2 + (tr() - 0.5) * 2.0, l = len * (0.5 + tr() * 0.5);
+        g.lineWidth = 2 + tr() * 3; g.beginPath(); g.moveTo(cx, y0 - tr() * 30); g.lineTo(cx + Math.cos(a) * l, y0 + Math.sin(a) * l); g.stroke();
+      }
+    }
+    for (let t = 0; t < 4; t++) {
+      const x0 = t * 256, cx = x0 + 128;
+      g.save(); g.beginPath(); g.rect(x0 + 4, 4, 248, 508); g.clip();     // keep each tree inside its own cell
+      if (t === 0) {
+        // conifer: tiers of drooping, needled branches, lighter towards the sun
+        trunk(cx, 120, 512, 3, 9);
+        for (let k = 0; k < 13; k++) {
+          const yb = 470 - k * 30, half = 104 - k * 7.4;
+          for (let m = 0; m < 260; m++) {
+            const u = tr() * 2 - 1, x = cx + u * half * (0.35 + 0.65 * tr());
+            const y = yb - Math.abs(u) * -14 - tr() * 46 * (1 - Math.abs(u) * 0.6);
+            const light = 0.42 - u * 0.24 + (tr() - 0.5) * 0.35 - (k < 3 ? 0.1 : 0);
+            g.strokeStyle = col(light); g.lineWidth = 1.6 + tr() * 1.6;
+            g.beginPath(); g.moveTo(x, y); g.lineTo(x + (tr() - 0.5) * 8 + u * 6, y + 6 + tr() * 8); g.stroke();
+          }
+        }
+      } else if (t === 1) {
+        // broadleaf: a wide rounded crown on a short trunk
+        trunk(cx, 300, 512, 7, 13); branches(cx, 330, 7, 110);
+        crown(cx, 210, 96, 156, 7, 2300);
+      } else if (t === 2) {
+        // poplar: tall and narrow
+        trunk(cx, 330, 512, 5, 10); branches(cx, 360, 4, 60);
+        crown(cx, 240, 54, 220, 5, 1900);
+      } else {
+        // bush and small tree: low and wide
+        trunk(cx, 380, 512, 6, 11); branches(cx, 400, 5, 90);
+        crown(cx, 320, 98, 118, 6, 1900);
+      }
+      g.restore();
     }
   }, { repeat: false });
   TEX.trees.wrapS = TEX.trees.wrapT = THREE.ClampToEdgeWrapping;
@@ -2396,7 +2543,9 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   // ------------------------------------------------------------------ landscape
   {
     TEX.grass.repeat.set(240, 240);
-    const g = new THREE.PlaneGeometry(9600, 9600);
+    // v6: one huge two-triangle plane could win the depth test against the track when seen at a grazing
+    // angle (low cameras, high-resolution screens); 40 x 40 tiles of 240 m keep it behind
+    const g = new THREE.PlaneGeometry(9600, 9600, 40, 40);
     g.rotateX(-Math.PI / 2);
     const mat = lambert({ map: TEX.grass });
     // large-scale colour variation, so the mowing pattern doesn't repeat visibly
@@ -2412,6 +2561,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
           'float nA = texture2D(uNoise, vWorldXZ / 330.0).r, nB = texture2D(uNoise, vWorldXZ / 41.0 + 0.37).r;',
           'diffuseColor.rgb *= mix(0.8, 1.12, nA) * mix(0.93, 1.06, nB);',
           'diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * vec3(1.1, 1.02, 0.78), smoothstep(0.58, 0.82, nA) * 0.8);',
+          'diffuseColor.rgb = mix(vec3(dot(diffuseColor.rgb, vec3(0.3, 0.59, 0.11))), diffuseColor.rgb, 0.86);',
         ].join('\n'));
     };
     addMesh(g, mat).position.y = -0.03;
@@ -2510,7 +2660,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   const asphaltMat = new THREE.MeshStandardMaterial({ map: TEX.asphalt, roughnessMap: TEX.asphaltRough, roughness: 1.0, metalness: 0.0, envMapIntensity: 0.7, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 });
   addMesh(ribbon((i) => -(barR(i) + 13.5), (i) => -(barR(i) + 0.6), 0.008, 0.008, 12, pitMask), asphaltMat, { receive: true });
   addMesh(ribbon(() => -(HW + 0.15), () => HW + 0.15, 0.012, 0.012, 12), asphaltMat, { receive: true });
-  // painted run-off behind the kerbs (it drives like grass) and soft darkening at the foot of every wall
+  // painted run-off behind the kerbs (it drives like slightly slippery asphalt, see physics surface 4) and soft darkening at the foot of every wall
   {
     const vergeMat = overlay({ map: TEX.verge }, 1);
     const vIn = (kerb) => (i) => (kerb(i) ? HW + KW - 0.02 : HW + 0.12);
@@ -2524,11 +2674,72 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   // rubbered-in line and brake marks
   TEX.rubber.wrapS = THREE.ClampToEdgeWrapping;
   addMesh(ribbon((i) => track.rlN[i] - 1.0, (i) => track.rlN[i] + 1.0, 0.016, 0.016, 8),
-    lambert({ color: 0x15171a, alphaMap: TEX.rubber, transparent: true, opacity: 0.32, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 }), { receive: true, order: 1 });
+    lambert({ color: 0x15171a, alphaMap: TEX.rubber, transparent: true, opacity: 0.36, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 }), { receive: true, order: 1 });
+  // v6 track detail: an unlit see-through layer with a texture alpha, a per-vertex fade along the track (aAlpha)
+  // and soft edges across it; used for the heavier rubber in the corners and the marbles outside the line
+  function decalMat(hex, map, opacity, factor) {
+    return new THREE.ShaderMaterial({
+      uniforms: Object.assign(THREE.UniformsUtils.clone(THREE.UniformsLib.fog), { uMap: { value: map }, uColor: { value: C(hex) }, uOpacity: { value: opacity } }),
+      fog: true, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: factor, polygonOffsetUnits: factor * 2,
+      vertexShader: [
+        '#include <common>', '#include <fog_pars_vertex>',
+        'attribute float aAlpha; varying float vAlpha; varying vec2 vUv;',
+        'void main() {',
+        '  vAlpha = aAlpha; vUv = uv;',
+        '  vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);',
+        '  gl_Position = projectionMatrix * mvPosition;',
+        '  #include <fog_vertex>',
+        '}',
+      ].join('\n'),
+      fragmentShader: [
+        'uniform sampler2D uMap; uniform vec3 uColor; uniform float uOpacity;',
+        'varying float vAlpha; varying vec2 vUv;',
+        '#include <common>', '#include <fog_pars_fragment>',
+        'void main() {',
+        '  float edge = smoothstep(0.0, 0.25, vUv.x) * smoothstep(1.0, 0.75, vUv.x);',
+        '  gl_FragColor = vec4(uColor, uOpacity * vAlpha * edge * texture2D(uMap, vUv * vec2(1.0, 1.0)).g);',
+        '  #include <tonemapping_fragment>',
+        '  #include <encodings_fragment>',
+        '  #include <fog_fragment>',
+        '}',
+      ].join('\n'),
+    });
+  }
+  // a weight along the track that is 1 where test(i) holds, spread `before`/`after` points and faded at the ends
+  function zoneWeight(test, before, after, fade) {
+    const on = new Uint8Array(N), w = new Float32Array(N);
+    for (let i = 0; i < N; i++) if (test(i)) for (let k = -after; k <= before; k++) on[(i - k + N) % N] = 1;
+    for (let i = 0; i < N; i++) {
+      if (!on[i]) continue;
+      let d = fade;
+      for (let k = 1; k < fade; k++) if (!on[(i + k) % N] || !on[(i - k + N) % N]) { d = k; break; }
+      w[i] = Math.min(1, d / fade);
+    }
+    return w;
+  }
+  function decalRibbon(offA, offB, y, vLen, weight, mat, minW = 0.4) {
+    const g = ribbon(offA, offB, y, y, vLen, (i) => weight[i] > 0 && offB(i) - offA(i) > minW);
+    const a = new Float32Array((N + 1) * 2);
+    for (let k = 0; k <= N; k++) a[k * 2] = a[k * 2 + 1] = weight[k % N];
+    g.setAttribute('aAlpha', new THREE.BufferAttribute(a, 1));
+    return addMesh(g, mat, { order: 1 });
+  }
+  {
+    // darker, wider rubber through the corners, where the tyres work hardest
+    const turnW = zoneWeight((i) => Math.abs(track.rlK[i]) > 1 / 250, nS(20), nS(30), nS(14));
+    decalRibbon((i) => track.rlN[i] - 1.25, (i) => track.rlN[i] + 1.25, 0.017, 6, turnW, decalMat(0x101114, TEX.noise, 0.34, -3));
+    // marbles on the outside of the tighter corners, from the apex to the exit
+    TEX.marbles.wrapS = TEX.marbles.wrapT = THREE.RepeatWrapping;
+    const marbleMat = decalMat(0x0b0c0e, TEX.marbles, 0.72, -3);
+    const leftW = zoneWeight((i) => track.rlK[i] > 1 / 220, nS(12), nS(60), nS(12));
+    const rightW = zoneWeight((i) => track.rlK[i] < -1 / 220, nS(12), nS(60), nS(12));
+    decalRibbon(() => -HW + 0.3, (i) => Math.min(track.rlN[i] - 1.7, HW - 0.5), 0.019, 3.5, leftW, marbleMat, 0.8);
+    decalRibbon((i) => Math.max(track.rlN[i] + 1.7, -HW + 0.5), () => HW - 0.3, 0.019, 3.5, rightW, marbleMat, 0.8);
+  }
   const brakeZone = (i) => { for (let k = 0; k < 18; k++) if (track.phase[(i + k) % N] < 0) return true; return false; };
   addMesh(ribbon((i) => track.rlN[i] - 1.1, (i) => track.rlN[i] + 1.1, 0.018, 0.018, 9, brakeZone),
     lambert({ color: 0x0d0e10, alphaMap: TEX.skid, transparent: true, opacity: 0.55, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -7 }), { receive: true, order: 1 });
-  const lineMat = overlay({ color: 0xeceeef }, 4);
+  const lineMat = overlay({ map: TEX.paint }, 4);
   addMesh(ribbon(() => HW - 0.22, () => HW + 0.02, 0.02, 0.02, 10), lineMat, { receive: true });
   addMesh(ribbon(() => -(HW + 0.02), () => -(HW - 0.22), 0.02, 0.02, 10), lineMat, { receive: true });
   const kerbMat = overlay({ map: TEX.kerb }, 5);
@@ -2571,11 +2782,68 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     const c = brake ? C_BRAKE : go ? C_GO : C_HOLD;
     return [c.r, c.g, c.b];
   };
-  const racingLine = addMesh(
-    ribbon((i) => track.rlN[i] - 0.42, (i) => track.rlN[i] + 0.42, 0.034, 0.034, 10, null, lineColor),
-    lambert({ vertexColors: true, emissive: 0x141414, transparent: true, opacity: 0.85, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -7, polygonOffsetUnits: -14 }),
-    { receive: true, order: 2 }
-  );
+  // v6: a slimmer line with soft edges. "Corners" shows it from just before each braking point to the exit of
+  // the corner, fading in and out, like the corners-only line in the console F1 games.
+  const racingLineMat = (() => {
+    const m = new THREE.ShaderMaterial({
+      uniforms: Object.assign(THREE.UniformsUtils.clone(THREE.UniformsLib.fog), { uOpacity: { value: 0.78 } }),
+      fog: true, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -7, polygonOffsetUnits: -14,
+      vertexShader: [
+        '#include <common>', '#include <fog_pars_vertex>',
+        'attribute vec3 color; attribute float aAlpha;',
+        'varying vec3 vCol; varying float vAlpha; varying float vU;',
+        'void main() {',
+        '  vCol = color; vAlpha = aAlpha; vU = uv.x;',
+        '  vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);',
+        '  gl_Position = projectionMatrix * mvPosition;',
+        '  #include <fog_vertex>',
+        '}',
+      ].join('\n'),
+      fragmentShader: [
+        'uniform float uOpacity;',
+        'varying vec3 vCol; varying float vAlpha; varying float vU;',
+        '#include <common>', '#include <fog_pars_fragment>',
+        'void main() {',
+        '  float edge = smoothstep(0.0, 0.32, vU) * smoothstep(1.0, 0.68, vU);',
+        '  gl_FragColor = vec4(vCol * 0.92, uOpacity * vAlpha * edge);',
+        '  #include <tonemapping_fragment>',
+        '  #include <encodings_fragment>',
+        '  #include <fog_fragment>',
+        '}',
+      ].join('\n'),
+    });
+    return m;
+  })();
+  function lineMesh(alphaAt) {
+    const mask = alphaAt ? (i) => alphaAt(i) > 0 : null;
+    const g = ribbon((i) => track.rlN[i] - 0.34, (i) => track.rlN[i] + 0.34, 0.034, 0.034, 10, mask, lineColor);
+    const a = new Float32Array((N + 1) * 2);
+    for (let k = 0; k <= N; k++) a[k * 2] = a[k * 2 + 1] = alphaAt ? alphaAt(k % N) : 1;
+    g.setAttribute('aAlpha', new THREE.BufferAttribute(a, 1));
+    return addMesh(g, racingLineMat, { order: 2 });
+  }
+  // corners: braking or turning (radius under 300 m), shown from 50 m before to 24 m after, gaps under 70 m filled
+  const cornerAlpha = (() => {
+    const base = new Uint8Array(N), show = new Uint8Array(N), w = new Float32Array(N);
+    for (let i = 0; i < N; i++) base[i] = track.phase[i] < 0 || Math.abs(track.rlK[i]) > 1 / 300 ? 1 : 0;
+    const before = nS(50), after = nS(24), gap = nS(70), fade = nS(16);
+    for (let i = 0; i < N; i++) if (base[i]) for (let k = -before; k <= after; k++) show[(i + k + N) % N] = 1;
+    for (let i = 0; i < N; i++) {
+      if (show[i] || !show[(i - 1 + N) % N]) continue;
+      let j = 0; while (j < gap && !show[(i + j) % N]) j++;
+      if (j < gap) for (let k = 0; k < j; k++) show[(i + k) % N] = 1;
+    }
+    // fade in and out over 16 m at both ends of each stretch
+    for (let i = 0; i < N; i++) {
+      if (!show[i]) { w[i] = 0; continue; }
+      let d = fade;
+      for (let k = 1; k < fade; k++) if (!show[(i + k) % N] || !show[(i - k + N) % N]) { d = k; break; }
+      w[i] = Math.min(1, d / fade);
+    }
+    return (i) => w[i];
+  })();
+  const racingLine = lineMesh(null);
+  const racingLineCorners = lineMesh(cornerAlpha);
   // barriers: tyre walls where the run-off is deep, advertising walls elsewhere; catch fencing all round
   const deep = (bar) => (i) => bar(i) >= 24;
   const notDeep = (bar) => (i) => bar(i) < 24.5;
@@ -2584,8 +2852,18 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   const tyreMat = lambert({ map: TEX.tyres, side: THREE.DoubleSide });
   addMesh(band((i) => barL(i), 0, 1.05, 4, notDeep(barL)), bannerMat);
   addMesh(band((i) => -barR(i), 0, 1.05, 4, notDeep(barR), true), bannerMat);
-  addMesh(band((i) => barL(i), 0, 1.0, 3.5, deep(barL)), tyreMat);
-  addMesh(band((i) => -barR(i), 0, 1.0, 3.5, deep(barR)), tyreMat);
+  // v6: blue, white and red energy-absorbing blocks at the big stops, where a car that misses its braking
+  // point goes straight on; tyre walls elsewhere in the deep run-offs
+  const bigStop = (() => {
+    const z = new Uint8Array(N);
+    for (let i = 0; i < N; i++) if (track.phase[i] < 0 && track.vProf[i] - track.vProf[(i + nS(60)) % N] > 25) for (let k = -nS(30); k <= nS(110); k++) z[(i + k + N) % N] = 1;
+    return (i) => z[i] === 1;
+  })();
+  const tecproMat = lambert({ map: TEX.tecpro, side: THREE.DoubleSide });
+  addMesh(band((i) => barL(i), 0, 1.0, 3.5, (i) => deep(barL)(i) && !bigStop(i)), tyreMat);
+  addMesh(band((i) => -barR(i), 0, 1.0, 3.5, (i) => deep(barR)(i) && !bigStop(i)), tyreMat);
+  addMesh(band((i) => barL(i) - 0.02, 0, 1.0, 6, (i) => deep(barL)(i) && bigStop(i)), tecproMat);
+  addMesh(band((i) => -(barR(i) - 0.02), 0, 1.0, 6, (i) => deep(barR)(i) && bigStop(i)), tecproMat);
   const fenceMat = lambert({ map: TEX.fence, transparent: true, alphaTest: 0.35, side: THREE.DoubleSide });
   addMesh(band((i) => barL(i), 1.05, 3.7, 2.4), fenceMat, { order: 3 });
   addMesh(band((i) => -barR(i), 1.05, 3.7, 2.4), fenceMat, { order: 3 });
@@ -3105,10 +3383,26 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
       ].join('\n'));
   };
   const std = (hex, rough, metal, o = {}) => new THREE.MeshStandardMaterial(Object.assign({ color: C(hex), roughness: rough, metalness: metal }, o));
+  // v6: a twill weave painted from the part's own coordinates, faded out beyond a few metres
+  const carbonMat = std(0x16171a, 0.45, 0.1, { envMapIntensity: 0.45 });
+  carbonMat.onBeforeCompile = (sh) => {
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nvarying vec3 vCarb;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvCarb = position;');
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying vec3 vCarb;')
+      .replace('#include <color_fragment>', [
+        '#include <color_fragment>',
+        'vec2 cq = vec2(vCarb.x + vCarb.z * 0.7, vCarb.y + vCarb.z * 0.7) * 70.0;',
+        'vec2 cc = floor(cq), cf = fract(cq);',
+        'float cd = mod(cc.x + cc.y, 2.0);',
+        'float fib = cd < 1.0 ? cf.x : cf.y;',
+        'float weave = 0.8 + 0.34 * sin(fib * 3.14159) * (cd < 1.0 ? 1.0 : 0.78);',
+        'diffuseColor.rgb *= mix(1.0, weave, 1.0 - smoothstep(2.5, 9.0, length(vViewPosition)));',
+      ].join('\n'));
+  };
   const CAR_MATS = {
     paint: paintMat,
     accent: new THREE.MeshPhysicalMaterial({ color: LIVERY.accent, roughness: 0.32, metalness: 0.1, clearcoat: 1.0, clearcoatRoughness: 0.08 }),
-    carbon: std(0x17191c, 0.42, 0.35),
+    carbon: carbonMat,
     gloss: new THREE.MeshPhysicalMaterial({ color: C(0x111214), roughness: 0.3, metalness: 0.2, clearcoat: 0.8, clearcoatRoughness: 0.1 }),
     dark: std(0x060708, 0.8, 0.0),
     tyre: std(0xffffff, 0.92, 0.0, { map: TEX.tyreSide, side: THREE.DoubleSide }),
@@ -3220,8 +3514,23 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
       flap = new THREE.Group(); flap.position.set(-2.64, 0.97, 0); flap.rotation.z = FLAP_SHUT;
       const fm = new THREE.Mesh(flapGeo, M.accent); fm.castShadow = true; flap.add(fm); body.add(flap);
     }
-    let rearLight = null;
-    if (!ghost) { rearLight = new THREE.Mesh(box(0.02, 0.06, 0.1), M.light); rearLight.position.set(-2.69, 0.3, 0); body.add(rearLight); }
+    let rearLight = null, rearGlow = null;
+    if (!ghost) {
+      rearLight = new THREE.Mesh(box(0.02, 0.05, 0.16), M.light); rearLight.position.set(-2.69, 0.3, 0); body.add(rearLight);
+      rearGlow = new THREE.Sprite(new THREE.SpriteMaterial({ map: TEX.puff, color: C(0xff3020), blending: THREE.AdditiveBlending, transparent: true, depthWrite: false, opacity: 0 }));
+      rearGlow.position.set(-2.73, 0.3, 0); rearGlow.scale.set(0.62, 0.42, 1); body.add(rearGlow);
+      // the car's number: on both rear wing endplates and on top of the nose (it reads from the front)
+      const numMat = new THREE.MeshStandardMaterial({ map: TEX.number, transparent: true, roughness: 0.4, metalness: 0, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+      for (const sd of [-1, 1]) {
+        const d = new THREE.Mesh(new THREE.PlaneGeometry(0.3, 0.3), numMat);
+        d.position.set(-2.42, 0.66, sd * 0.5195); if (sd < 0) d.rotation.y = Math.PI;
+        body.add(d);
+      }
+      const al = Math.atan(0.25), nose = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.16), numMat);
+      nose.matrixAutoUpdate = false;
+      nose.matrix.makeBasis(new THREE.Vector3(0, 0, -1), new THREE.Vector3(-Math.cos(al), Math.sin(al), 0), new THREE.Vector3(Math.sin(al), Math.cos(al), 0)).setPosition(2.55, 0.371, 0);
+      body.add(nose);
+    }
     // wheels: low-profile tyres on 18-inch rims with aero covers
     const wheels = [];
     for (const [x, w, z, front] of [[1.55, 0.3, 0.8, true], [1.55, 0.3, -0.8, true], [-2.05, 0.4, 0.78, false], [-2.05, 0.4, -0.78, false]]) {
@@ -3250,10 +3559,10 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
       sh.rotation.x = -Math.PI / 2; sh.position.set(-0.3, 0.09, 0); sh.renderOrder = 4;
       group.add(sh);
     }
-    return { group, body, wheels, flap, rearLight, ghostMat };
+    return { group, body, wheels, flap, rearLight, rearGlow, ghostMat };
   }
   const mainCar = buildCar(false);
-  const carGroup = mainCar.group, carBody = mainCar.body, wheels = mainCar.wheels, rearLight = mainCar.rearLight, drsFlap = mainCar.flap;
+  const carGroup = mainCar.group, carBody = mainCar.body, wheels = mainCar.wheels, rearLight = mainCar.rearLight, rearGlow = mainCar.rearGlow, drsFlap = mainCar.flap;
   scene.add(carGroup);
   const ghostCar = buildCar(true);
   ghostCar.group.visible = false;
@@ -3286,6 +3595,84 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
       const sz = p.size * (0.6 + 1.6 * t);
       p.s.scale.set(sz, sz, 1);
       p.s.material.opacity = 0.55 * (1 - t);
+    }
+  }
+
+  // ------------------------------------------------------------------ sparks from the skid blocks under the floor
+  // At high speed the downforce squashes the car onto its titanium skid blocks: sparks over the bumps, on
+  // the kerbs and under heavy braking. One mesh of camera-facing streaks, drawn additively.
+  const SPARKS = 96;
+  const sparkPos = new Float32Array(SPARKS * 12), sparkCol = new Float32Array(SPARKS * 16);
+  const sparkGeo = new THREE.BufferGeometry();
+  sparkGeo.setAttribute('position', new THREE.BufferAttribute(sparkPos, 3).setUsage(THREE.DynamicDrawUsage));
+  sparkGeo.setAttribute('aCol', new THREE.BufferAttribute(sparkCol, 4).setUsage(THREE.DynamicDrawUsage));
+  {
+    const idx = [];
+    for (let k = 0; k < SPARKS; k++) { const o = k * 4; idx.push(o, o + 2, o + 1, o + 1, o + 2, o + 3); }
+    sparkGeo.setIndex(idx);
+  }
+  const sparkMesh = new THREE.Mesh(sparkGeo, new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+    vertexShader: 'attribute vec4 aCol; varying vec4 vCol; void main() { vCol = aCol; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: 'varying vec4 vCol; void main() { gl_FragColor = vec4(vCol.rgb * vCol.a, vCol.a); }',
+  }));
+  sparkMesh.frustumCulled = false; sparkMesh.renderOrder = 6;
+  scene.add(sparkMesh);
+  const sparks = [];
+  for (let k = 0; k < SPARKS; k++) sparks.push({ x: 0, y: -50, z: 0, vx: 0, vy: 0, vz: 0, life: 1, max: 1 });
+  let sparkIdx = 0, sparkAcc = 0;
+  function emitSpark(x, y, z, vx, vy, vz, life) {
+    const p = sparks[sparkIdx]; sparkIdx = (sparkIdx + 1) % SPARKS;
+    p.x = x; p.y = y; p.z = z; p.vx = vx; p.vy = vy; p.vz = vz; p.life = 0; p.max = life;
+  }
+  const _sr = new THREE.Vector3(), _sc = new THREE.Vector3(), _ss = new THREE.Vector3();
+  // cvx, cvz: the car's (and so the camera's) velocity; the streak shows the spark's motion as the camera sees it
+  function updateSparks(dt, cvx, cvz, live) {
+    for (let k = 0; k < SPARKS; k++) {
+      const p = sparks[k], o = k * 12, c = k * 16;
+      if (live && p.life < p.max) {
+        p.life += dt;
+        p.vy -= 9.8 * dt; p.vx *= 1 - 1.5 * dt; p.vz *= 1 - 1.5 * dt;
+        p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
+        if (p.y < 0.012) { p.y = 0.012; p.vy = Math.abs(p.vy) * 0.3; p.vx *= 0.8; p.vz *= 0.8; }
+      }
+      const a = p.life < p.max ? 1 - p.life / p.max : 0;
+      _sr.set(p.vx - cvx, p.vy, p.vz - cvz);
+      const len = Math.min(1.1, 0.03 * _sr.length() + 0.03);
+      _sr.normalize();
+      _sc.set(p.x - camera.position.x, p.y - camera.position.y, p.z - camera.position.z);
+      _ss.crossVectors(_sr, _sc).normalize().multiplyScalar(0.03 + 0.004 * Math.sqrt(_sc.length()));   // wider far away, so a streak stays a few pixels wide
+      const tx = p.x - _sr.x * len, ty = p.y - _sr.y * len, tz = p.z - _sr.z * len;
+      sparkPos[o] = p.x + _ss.x; sparkPos[o + 1] = p.y + _ss.y; sparkPos[o + 2] = p.z + _ss.z;
+      sparkPos[o + 3] = p.x - _ss.x; sparkPos[o + 4] = p.y - _ss.y; sparkPos[o + 5] = p.z - _ss.z;
+      sparkPos[o + 6] = tx + _ss.x; sparkPos[o + 7] = ty + _ss.y; sparkPos[o + 8] = tz + _ss.z;
+      sparkPos[o + 9] = tx - _ss.x; sparkPos[o + 10] = ty - _ss.y; sparkPos[o + 11] = tz - _ss.z;
+      // white-hot head, orange tail
+      sparkCol[c] = sparkCol[c + 4] = 1.6; sparkCol[c + 1] = sparkCol[c + 5] = 1.25; sparkCol[c + 2] = sparkCol[c + 6] = 0.7; sparkCol[c + 3] = sparkCol[c + 7] = a;
+      sparkCol[c + 8] = sparkCol[c + 12] = 1.0; sparkCol[c + 9] = sparkCol[c + 13] = 0.38; sparkCol[c + 10] = sparkCol[c + 14] = 0.08; sparkCol[c + 11] = sparkCol[c + 15] = 0;
+    }
+    sparkGeo.attributes.position.needsUpdate = true;
+    sparkGeo.attributes.aCol.needsUpdate = true;
+  }
+  // where along the lap the track is bumpy enough to bottom the car out (a fixed pattern, so each lap matches)
+  const bumpAt = (s) => Math.sin(s * 0.045) + 0.8 * Math.sin(s * 0.11 + 1.7) + 0.5 * Math.sin(s * 0.29 + 0.4);   // about 19 bumpy patches a lap
+  function emitSparks(dt, x, y, psi) {
+    const v = Math.max(0, car.v);
+    const fast = clamp((v - 66) / 22, 0, 1);                    // from about 240 km/h
+    const bump = bumpAt(car.s) > 1.35 ? 1 : 0;
+    const kerb = (car.surfL === 1 || car.surfR === 1) && v > 50 ? clamp((v - 50) / 20, 0, 1) : 0;   // fast kerbs only
+    const brake = car.brk > 0.45 && v > 62 ? car.brk : 0;                                            // stopping from top speed
+    const rate = fast * (bump ? 150 : 4) + kerb * 35 + brake * 70 * clamp((v - 62) / 20, 0, 1);
+    sparkAcc += rate * dt;
+    if (sparkAcc > 12) sparkAcc = 12;
+    const cp = Math.cos(psi), sp = Math.sin(psi);
+    while (sparkAcc >= 1) {
+      sparkAcc -= 1;
+      // under the plank; braking sparks come from further forward, where the nose dives
+      const lx = brake && rnd() < 0.6 ? 0.2 + rnd() * 0.9 : -1.7 + rnd() * 2.2, lz = (rnd() - 0.5) * 0.5;
+      const wx = x + cp * lx - sp * lz, wy = y + sp * lx + cp * lz;
+      const keep = 0.55 + rnd() * 0.3, side = (rnd() - 0.5) * 5;
+      emitSpark(wx, 0.04, -wy, (cp * v * keep - sp * side), 0.4 + rnd() * 2.6, -(sp * v * keep + cp * side), 0.16 + rnd() * 0.26);
     }
   }
 
@@ -3479,7 +3866,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     refAngle: -90,          // direction of "down" for the way the phone is held, deg
     raw: 0, angle: 0,       // how far the phone is turned, deg (+ = clockwise = right)
     flatFor: 0, flipFor: 0, flatHint: false,
-    filter: new OneEuro(1.6, 0.045, 1.0),
+    filter: new OneEuro(3.0, 0.1, 2.0),   // v6: 15-35 ms behind the phone instead of 40-80 ms
   };
   function feedTilt(gx, gy, t, source) {
     tilt.source = source;
@@ -3795,9 +4182,20 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     const target = (keys.left ? 1 : 0) - (keys.right ? 1 : 0);
     keySteer += clamp(target - keySteer, -dt * 4, dt * 4);
     let steer;
+    const tiltNow = steerMode() === 'tilt';
     if (target !== 0 || Math.abs(keySteer) > 0.01) steer = keySteer;
-    else if (steerMode() === 'tilt') steer = tiltSteer();
+    else if (tiltNow) steer = tiltSteer();
     else steer = touch.hasSteer ? touch.steer : 0;
+    // the phone is already smoothed by the tilt filter, so the steering may follow it faster
+    car.P.steerRate = tiltNow ? STEER_RATE_TILT : STEER_RATE_TOUCH;
+    // steering assist: closes part of the gap between your steering and the ideal steering. It fades in
+    // and out, and stays out of the way when the car is slow, spun or far from the track.
+    const wantW = (STEER_ASSIST[settings.steerAssist] || 0) * (mode === 'drive' && car.u > 8 && Math.abs(car.n) < track.hw + 7 && Math.abs(car.beta) < 0.35 ? 1 : 0);
+    steerAssistW += clamp(wantW - steerAssistW, -dt * 2.5, dt * 2.5);
+    if (steerAssistW > 0.002) {
+      const ideal = assistPilot.inputs(car).steer;
+      steer = clamp(steer + steerAssistW * (ideal - steer), -1, 1);
+    }
     let thr = Math.max(touch.thr, keys.up ? 1 : 0);
     const brk = Math.max(touch.brk, keys.down ? 1 : 0);
     let brake = brk;
@@ -3814,7 +4212,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     return { steer, throttle: thr, brake };
   }
   const assistProfile = track.brakingProfile(0.9, 0.82);
-  let assistBraking = false;
+  let assistBraking = false, steerAssistW = 0;
 
   // ------------------------------------------------------------------ HUD
   const el = {
@@ -3830,7 +4228,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     tcSteps: $('tcSteps'), tcStep2: $('tcStep2'),
     btnStart: $('btnStart'), btnQuali: $('btnQuali'), btnNext: $('btnNext'), btnQuit: $('btnQuit'), btnResume: $('btnResume'), btnRestart2: $('btnRestart2'),
     eyebrow: $('eyebrow'), menuTitle: $('menuTitle'), menuSub: $('menuSub'), facts: $('facts'),
-    tLine: $('tLine'), tGhost: $('tGhost'), tSound: $('tSound'),
+    tGhost: $('tGhost'), tSound: $('tSound'), steerAssistNote: $('steerAssistNote'),
     tiltCard: $('tiltCard'), tcTitle: $('tcTitle'), tcState: $('tcState'), tcMeter: $('tcMeter'), tcNeedle: $('tcNeedle'), tcText: $('tcText'),
     tcActions: $('tcActions'), openTab: $('openTab'), btnCopy: $('btnCopy'), btnAllow: $('btnAllow'), tcLink: $('tcLink'),
     howto: $('howto'), rowScreen: $('rowScreen'), rowCentre: $('rowCentre'), centreVal: $('centreVal'), limitsNote: $('limitsNote'), levelNote: $('levelNote'),
@@ -4031,8 +4429,8 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     wrongTime = car.v > 3 && dot < -0.3 ? wrongTime + dt : 0;
     const wrong = wrongTime > 1.0 && mode === 'drive';
     if (wrong !== shown.wrong) { el.callout.hidden = !wrong; el.callout.textContent = 'WRONG WAY'; el.callout.className = 'callout is-warn'; shown.wrong = wrong; }
-    const surf = Math.max(car.surfL, car.surfR);
-    if (surf !== lastSurf) { if (surf === 1) buzz(6); else if (surf >= 2) buzz(14); lastSurf = surf; }
+    const surf = worstSurf(car.surfL, car.surfR);
+    if (surf !== lastSurf) { if (surf === 1) buzz(6); else if (FL.isRough(surf)) buzz(14); lastSurf = surf; }
   }
   function updateScreen() {
     const last = timer.laps.length ? timer.laps[timer.laps.length - 1] : null;
@@ -4187,7 +4585,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     if (mode !== 'drive') { stuckT = 0; if (!el.back.hidden) el.back.hidden = true; return; }
     const v = Math.abs(car.v);
     const dot = Math.cos(car.psi) * track.tx[car.idx] + Math.sin(car.psi) * track.ty[car.idx];
-    const off = car.outOfBounds || Math.max(car.surfL, car.surfR) >= 2;
+    const off = car.outOfBounds || FL.isRough(car.surfL) || FL.isRough(car.surfR);
     const stuck = (v < 4 && (off || dot < 0.3)) || (dot < -0.4 && v < 15);
     stuckT = stuck ? stuckT + dt : 0;
     const show = stuckT > 1.0;
@@ -4230,7 +4628,8 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
       camera.fov = portrait ? 68 : 46;
     } else if (settings.cam === 'tcam') {
       const fx = Math.cos(psi), fy = Math.sin(psi);
-      camera.position.set(x + fx * 0.05, 1.24, -(y + fy * 0.05));
+      const jig = reduceMotion || mode !== 'drive' ? 0 : 0.004 + 0.008 * clamp((v - 60) / 30, 0, 1) + (FL.isRough(car.surfL) || FL.isRough(car.surfR) ? 0.02 : car.surfL === 1 || car.surfR === 1 ? 0.012 : 0);
+      camera.position.set(x + fx * 0.05, 1.24 + (Math.random() - 0.5) * jig, -(y + fy * 0.05) + (Math.random() - 0.5) * jig);
       camera.lookAt(x + fx * 25, 0.6, -(y + fy * 25));
       camera.fov = (portrait ? 80 : 66) + (reduceMotion ? 0 : 6 * Math.min(1, v / 85));
     } else {
@@ -4241,11 +4640,12 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
       const lookAhead = near ? 7 : 8.5, lookH = near ? -0.4 : -0.15;
       const fx = Math.cos(cam.yaw), fy = Math.sin(cam.yaw);
       let px = x - fx * dist, py = y - fy * dist, pz = hgt;
-      const rough = car.surfL >= 2 || car.surfR >= 2 ? 1 : car.surfL === 1 || car.surfR === 1 ? 0.35 : 0;
+      const rough = FL.isRough(car.surfL) || FL.isRough(car.surfR) ? 1 : car.surfL === 1 || car.surfR === 1 ? 0.35 : car.surfL === 4 || car.surfR === 4 ? 0.12 : 0;
       const moving = mode === 'drive' ? 1 : 0;
       cam.shake += (moving * rough * Math.min(1, v / 40) - cam.shake) * Math.min(1, dt * 10);
       cam.kick *= Math.exp(-dt * 6);
-      const amp = reduceMotion ? 0 : 0.05 * cam.shake + 0.25 * cam.kick;
+      const fastShake = mode === 'drive' ? 0.022 * clamp((v - 69) / 22, 0, 1) : 0;
+      const amp = reduceMotion ? 0 : 0.05 * cam.shake + 0.25 * cam.kick + fastShake;
       if (amp > 0.002) { pz += (Math.random() - 0.5) * amp; px += (Math.random() - 0.5) * amp; py += (Math.random() - 0.5) * amp; }
       camera.position.set(px, pz, -py);
       camera.lookAt(x + fx * lookAhead, lookH, -(y + fy * lookAhead));
@@ -4559,10 +4959,16 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     const cls = (steerMode() === 'tilt' ? 'steer-tilt' : 'steer-touch') + (slideMode() ? ' ped-slide' : ' ped-split');
     if (el.hud.className !== cls) { el.hud.className = cls; ptrs.clear(); syncTouch(); measure(); }
   }
+  const STEER_ASSIST_NOTES = {
+    off: 'All the steering is yours.',
+    medium: 'Nudges your steering toward the ideal line. You stay in charge.',
+    strong: 'Corrects more of each mistake. Good while learning the track.',
+  };
   function applySettings() {
-    racingLine.visible = settings.line;
+    racingLine.visible = settings.line === 'full';
+    racingLineCorners.visible = settings.line === 'corners';
     judge.mode = settings.limits;
-    el.tLine.setAttribute('aria-pressed', String(settings.line));
+    el.steerAssistNote.textContent = STEER_ASSIST_NOTES[settings.steerAssist] || '';
     el.tGhost.setAttribute('aria-pressed', String(settings.ghost));
     el.tSound.setAttribute('aria-pressed', String(settings.sound));
     for (const seg of segs) for (const b of seg.querySelectorAll('.seg-btn')) b.setAttribute('aria-checked', String(settings[seg.dataset.key] === b.dataset.val));
@@ -4583,7 +4989,6 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
       saveStore();
     });
   }
-  el.tLine.addEventListener('click', () => { settings.line = !settings.line; applySettings(); saveStore(); });
   el.tGhost.addEventListener('click', () => { settings.ghost = !settings.ghost; applySettings(); saveStore(); });
   el.tSound.addEventListener('click', () => { settings.sound = !settings.sound; if (settings.sound) audio.start(true); applySettings(); saveStore(); });
   $('btnCentre').addEventListener('click', () => {
@@ -4794,7 +5199,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   }
 
   // ------------------------------------------------------------------ saved on this phone: settings, personal best, its ghost, best grid slots
-  const STORE_KEY = 'flying-lap:hungaroring:v5', OLD_KEYS = ['flying-lap:hungaroring:v4', 'flying-lap:hungaroring:v3'];
+  const STORE_KEY = 'flying-lap:hungaroring:v6', OLD_KEYS = ['flying-lap:hungaroring:v5', 'flying-lap:hungaroring:v4', 'flying-lap:hungaroring:v3'];
   function readStore() {
     try {
       let s = window.localStorage.getItem(STORE_KEY);
@@ -4806,8 +5211,8 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     const round = (a, k) => Array.from(a, (v) => Math.round(v * k) / k);
     const b = timer.bestLap;
     return {
-      v: 5,
-      settings: { steer: settings.steer, sens: settings.sens, limits: settings.limits, screen: settings.screen, line: settings.line, ghost: settings.ghost, sound: settings.sound, cam: settings.cam, tiltOffset: settings.tiltOffset, assist: settings.assist, level: settings.level, pedals: settings.pedals },
+      v: 6,
+      settings: { steer: settings.steer, sens: settings.sens, limits: settings.limits, screen: settings.screen, line: settings.line, ghost: settings.ghost, sound: settings.sound, cam: settings.cam, tiltOffset: settings.tiltOffset, assist: settings.assist, steerAssist: settings.steerAssist, level: settings.level, pedals: settings.pedals },
       best: b ? { time: b.time, sectors: b.sectors, lap: b.lap } : null,
       trace: timer.bestTrace ? round(timer.bestTrace, 1000) : null,
       sectors: timer.bestSectors.map((v) => (isFinite(v) ? v : null)),
@@ -4832,10 +5237,14 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     pick('tiltOffset', (v) => typeof v === 'number' && Math.abs(v) <= 25);
     pick('assist', (v) => v === 'on' || v === 'off');
     pick('level', (v) => v in LEVELS);
-    for (const k of ['line', 'ghost', 'sound']) pick(k, (v) => typeof v === 'boolean');
+    for (const k of ['ghost', 'sound']) pick(k, (v) => typeof v === 'boolean');
+    // the racing line was on or off before v6; "on" now shows it in the corners only
+    if (typeof s.line === 'boolean') settings.line = s.line ? 'corners' : 'off';
+    else pick('line', (v) => LINE_MODES.includes(v));
+    if (version >= 6) pick('steerAssist', (v) => v in STEER_ASSIST);
   }
   function loadData(d) {
-    if (!d || !(d.v >= 3 && d.v <= 5)) return;
+    if (!d || !(d.v >= 3 && d.v <= 6)) return;
     applyStoredSettings(d.settings, d.v);
     if (d.best && isFinite(d.best.time) && Array.isArray(d.best.sectors)) {
       timer.bestLap = { lap: d.best.lap || 0, time: d.best.time, sectors: d.best.sectors, valid: true, reason: null, flashbacks: 0 };
@@ -4977,7 +5386,9 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
       w.spin.rotation.z = wheelSpin; if (w.front) w.pivot.rotation.y = steerVis;
       if (w.covers[0].material !== coverMat) for (const c of w.covers) c.material = coverMat;
     }
-    rearLight.material.color.copy(car.thr < 0.1 && car.v > 20 && (clock * 6) % 2 < 1 ? REAR_ON : REAR_OFF);
+    const rearOn = car.thr < 0.1 && car.v > 20 && (clock * 6) % 2 < 1;
+    rearLight.material.color.copy(rearOn ? REAR_ON : REAR_OFF);
+    rearGlow.material.opacity = rearOn ? 0.95 : 0;
     drsFlap.rotation.z = FLAP_SHUT + (FLAP_OPEN - FLAP_SHUT) * car.drs;
     const drsOpen = car.drs > 0.5;
     if (drsOpen !== drsWasOpen) { drsWasOpen = drsOpen; if (mode === 'drive') audio.drsClick(drsOpen); }
@@ -4992,10 +5403,15 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
       const cp = Math.cos(ipsi), sp = Math.sin(ipsi);
       const rearX = ix - cp * 2.0, rearY = iy - sp * 2.0;
       if (v > 12 && car.squeal > 0.55) emitPuff(rearX + (rnd() - 0.5), 0.4, -(rearY + (rnd() - 0.5)), PUFF_SMOKE, 1.4, 0.9, -cp * v * 0.15, sp * v * 0.15);
-      const off = Math.max(car.surfL, car.surfR);
-      if (v > 8 && off >= 2) emitPuff(rearX + (rnd() - 0.5) * 1.6, 0.35, -(rearY + (rnd() - 0.5) * 1.6), off === 3 ? PUFF_GRAVEL : PUFF_GRASS, off === 3 ? 2.2 : 1.4, 1.1, -cp * v * 0.1, sp * v * 0.1);
+      const off = worstSurf(car.surfL, car.surfR);
+      if (v > 8 && FL.isRough(off)) emitPuff(rearX + (rnd() - 0.5) * 1.6, 0.35, -(rearY + (rnd() - 0.5) * 1.6), off === 3 ? PUFF_GRAVEL : PUFF_GRASS, off === 3 ? 2.2 : 1.4, 1.1, -cp * v * 0.1, sp * v * 0.1);
     }
     if (mode !== 'pause' && mode !== 'flash') updatePuffs(dt);
+    if (running) emitSparks(dt, ix, iy, ipsi);
+    {
+      const cvx = Math.cos(ipsi) * car.v, cvz = -Math.sin(ipsi) * car.v;
+      updateSparks(dt, cvx, cvz, running);
+    }
 
     if (car.wallHit > 0) {
       const hit = car.wallHit; car.wallHit = 0;
@@ -5049,7 +5465,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   // test hook (a read-only view of the state, plus a teleport for screenshots)
   window.__game = {
     get mode() { return mode; }, car, timer, track, settings, tilt, judge, start: startDriving, startQuali: startQualifying, quali, classify, finalGrid, centring,
-    get gameUrl() { return gameUrl; }, get assistBraking() { return assistBraking; }, endSession: () => endSession(), get input() { return lastInput; },
+    get gameUrl() { return gameUrl; }, get assistBraking() { return assistBraking; }, get steerAssistW() { return steerAssistW; }, endSession: () => endSession(), get input() { return lastInput; },
     get rot() { return rot; }, get ghost() { return ghost; }, get hist() { return hist.length; },
     get fps() { return window.__fps; }, get pixelRatio() { return pixelRatio; },
     get audio() { return audio.ctx ? { state: audio.ctx.state, keep: !!audio.keep } : null; },
@@ -5058,7 +5474,8 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     ff(sec) { const n = Math.round(sec * 240); for (let k = 0; k < n; k++) step(); prev.x = car.x; prev.y = car.y; prev.psi = car.psi; },
     get ghostVisible() { return ghostCar.group.visible; }, get ghostOpacity() { return ghostCar.ghostMat.opacity; },
     get hud() { return el.hud.className; }, get steerMode() { return steerMode(); },
-    view(v) { camOverride = v; }, freeze(v) { frozen = v; }, get touch() { return { thr: touch.thr, brk: touch.brk, steer: touch.steer }; }, get stick() { return stickShown; },
+    view(v) { camOverride = v; }, freeze(v) { frozen = v; }, get sparksAlive() { return sparks.filter((q) => q.life < q.max).length; },
+    sparkBurst(n) { sparkAcc = 0; const brk = car.brk; for (let k = 0; k < n; k++) { sparkAcc += 1; emitSparks(0, car.x, car.y, car.psi); } car.brk = brk; }, get touch() { return { thr: touch.thr, brk: touch.brk, steer: touch.steer }; }, get stick() { return stickShown; },
     debugMats() { const out = []; world.traverse((o) => { if (o.isMesh && o.material && o.material.alphaMap) out.push({ type: o.type, count: o.count, verts: o.geometry.attributes.position.count, opacity: o.material.opacity, visible: o.visible, order: o.renderOrder, inst: !!o.isInstancedMesh, pos: o.isInstancedMesh ? null : Array.from(o.geometry.attributes.position.array.slice(0, 3)).map((v) => +v.toFixed(1)) }); }); return out; },
   };
 
@@ -5068,12 +5485,12 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     // tilt is the default on phones and tablets, touch (or the keyboard) elsewhere
     if (!(window.matchMedia && matchMedia('(pointer: coarse)').matches)) settings.steer = 'touch';
     try {
-      if (data.v >= 3 && data.v <= 5) { loadData(data); if (Array.isArray(data.laps)) timer.laps = data.laps; }
+      if (data.v >= 3 && data.v <= 6) { loadData(data); if (Array.isArray(data.laps)) timer.laps = data.laps; }
       else {
         loadData(readStore());
         if (data.physics === 2 && data.settings) {
           if (TILT_PRESETS[data.settings.steering]) settings.sens = data.settings.steering;
-          if (typeof data.settings.line === 'boolean') settings.line = data.settings.line;
+          if (typeof data.settings.line === 'boolean') settings.line = data.settings.line ? 'corners' : 'off';
           if (typeof data.settings.sound === 'boolean') settings.sound = data.settings.sound;
           if (CAMS.includes(data.settings.cam)) settings.cam = data.settings.cam;
         }
