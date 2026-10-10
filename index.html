@@ -222,6 +222,8 @@ body {
 .spd span { font-weight: 700; font-size: 28px; font-variant-numeric: tabular-nums; min-width: 3ch; text-align: right; }
 .spd small { font-size: 10px; font-weight: 700; letter-spacing: 0.12em; color: var(--ink-dim); text-align: right; }
 .wheel { flex: none; width: 26px; height: 26px; color: var(--ink); will-change: transform; }
+/* v7: amber while the car is scrubbing speed to make a corner (steering past the grip limit) */
+.wheel.is-scrub { color: #ffb51e; filter: drop-shadow(0 0 4px rgba(255, 181, 30, 0.55)); }
 .aero { display: grid; justify-items: start; gap: 2px; }
 .df { font-size: 12px; font-weight: 700; color: var(--ink-dim); font-variant-numeric: tabular-nums; letter-spacing: 0.02em; white-space: nowrap; }
 .drs {
@@ -1081,7 +1083,8 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
    shared with braking/drive force. Driver aids: speed-sensitive steering that turns thumb input into a
    path curvature, yaw feedback (counter-steer), stability control, ABS and traction control.
    v3 adds DRS (automatic in the two real zones), state snapshots for flashbacks, track recovery and a
-   track-limits judge that can tell running wide from cutting a corner. */
+   track-limits judge that can tell running wide from cutting a corner. v6: painted run-off, kinder grass.
+   v7: optional turning help (gripBoost, scrubBrake) for steering past the grip limit; off by default here. */
 (function (root) {
   'use strict';
 
@@ -1122,6 +1125,8 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     drsDrag: 0.12,        // DRS open: share of drag area removed
     drsRearDf: 0.25,      // DRS open: share of rear downforce removed
     drsMinSpeed: 30,      // m/s, DRS opens only above ~108 km/h
+    gripBoost: 0,         // v7 turning help: extra cornering grip when steering past the limit (the game sets it)
+    scrubBrake: 0,        // v7 turning help: m/s^2 of scrub braking at full lock past the limit (the game sets it)
     wheelOffset: 0.8,     // lateral wheel position used for surface sampling, m
   };
 
@@ -1449,7 +1454,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
       this.thr = 0; this.brk = 0; this.steer = 0; this.delta = 0;
       this.fyf = 0; this.fyr = 0; this.axF = 0;
       this.aLat = 0; this.aLong = 0; this.beta = 0; this.squeal = 0; this.slideF = 0; this.slideR = 0;
-      this.downforce = 0; this.gripUse = 0;
+      this.downforce = 0; this.gripUse = 0; this.boost = 0; this.scrubbing = 0;
       this.drs = 0; this.drsAvail = false; this.drsEnabled = true;
       this.gear = 1; this.rpm = RPM_IDLE; this.shiftCount = 0;
       this.wallHit = 0;
@@ -1517,12 +1522,26 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
       const muS = 0.5 * (SURF_MU[this.surfL] + SURF_MU[this.surfR]);
       const ld = axleLoads(P, v, this.axF, this._loads, this.drs);
       const fzf = ld[0], fzr = ld[1];
-      const gf = axleGrip(P, fzf, P.weightFront, 1, muS);
-      const gr = axleGrip(P, fzr, 1 - P.weightFront, P.muRear, muS);
+      // v7 turning help. When the steering asks for more cornering than the tyres can give at this speed
+      // (over > 0), the car scrubs speed (scrubBrake, like a driver who turns in hard and lets the front tyres
+      // slow the car) and gets a little extra grip (gripBoost). As the speed drops the same steering turns the
+      // car tighter, so it makes the corner instead of running wide. Both are 0 in the base parameters: the
+      // computer driver, the perfect lap and the tests drive pure tyre physics unless the game turns them on.
+      const latBase = limits(P, ua, muS, this.drs).lat;
+      let over = 0;
+      if ((P.gripBoost > 0 || P.scrubBrake > 0) && ua > 8) {
+        const kM = Math.min(P.steerLock, P.steerAuthority * latBase / Math.max(u * u, 1));
+        const demand = (u * u * Math.abs(this.steer) * kM) / Math.max(latBase, 1);   // 1 = right at the limit
+        over = clamp((demand - 1) / (P.steerAuthority - 1), 0, 1);
+      }
+      const boost = P.gripBoost * over;
+      this.boost = over;
+      const gf = axleGrip(P, fzf, P.weightFront, 1, muS) * (1 + boost);
+      const gr = axleGrip(P, fzr, 1 - P.weightFront, P.muRear, muS) * (1 + boost);
       this.downforce = ld[2];
 
       // steering aid: thumb input -> desired path curvature -> road-wheel angle
-      const latLim = limits(P, ua, muS, this.drs).lat;
+      const latLim = latBase * (1 + boost);
       const kGrip = latLim / Math.max(u * u, 1);
       this.kMax = Math.min(P.steerLock, P.steerAuthority * kGrip);
       const kDes = this.steer * this.kMax;
@@ -1539,7 +1558,9 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
 
       const surfDrag = 0.5 * (SURF_DRAG_A[this.surfL] + SURF_DRAG_A[this.surfR]) +
         0.5 * (SURF_DRAG_B[this.surfL] + SURF_DRAG_B[this.surfR]) * v;
-      const resist = (0.5 * P.rho * dragArea(P, this.drs) * v * v) / m + P.crr * G + surfDrag; // m/s^2
+      const scrubDrag = P.scrubBrake * over;
+      this.scrubbing = scrubDrag;
+      const resist = (0.5 * P.rho * dragArea(P, this.drs) * v * v) / m + P.crr * G + surfDrag + scrubDrag; // m/s^2
 
       let nu, nw, nr, fx = 0, fy = 0;
       const reversing = u < -0.05 || (ua < 0.3 && this.brk > 0.3 && this.thr < 0.05);
@@ -1560,7 +1581,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
         // ABS holds braking slip at the peak; traction control keeps drive slip inside the friction circle.
         const peak = this.alphaPeak;
         const anF = alphaF / peak, anR = alphaR / peak;
-        let drive = this.thr * P.power / Math.max(ua, 3);
+        let drive = this.thr * P.power / Math.max(ua, 3) * (1 - 0.4 * over);
         const bReq = this.brk * m * P.brakeCap;
         const shareF = gf / Math.max(gf + gr, 1);
         const reqF = -bReq * shareF, reqR = drive - bReq * (1 - shareF);
@@ -1579,9 +1600,9 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
         const beta = Math.atan2(w, uEff);
         if (P.stability > 0 && ua > 6) {
           const err = r - rDes;
-          const over = Math.abs(r) > Math.abs(rDes) && err * r > 0;
+          const overRot = Math.abs(r) > Math.abs(rDes) && err * r > 0;
           const slide = clamp((Math.abs(beta) - 0.035) / 0.06, 0, 1);
-          if (over && slide > 0) mz -= P.stability * slide * (P.yawInertia / 0.12) * err;
+          if (overRot && slide > 0) mz -= P.stability * slide * (P.yawInertia / 0.12) * err;
         }
         nu = u + (fx / m + w * r) * dt;
         nw = w + (fy / m - u * r) * dt;
@@ -1946,8 +1967,10 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   // tilt steering: how far the phone is turned for full lock (degrees) and response curve
   // (v6: about 40% more sensitive. Normal was 18 degrees, so a corner at the limit took about 14 degrees of turn)
   const TILT_PRESETS = { calm: { range: 15, expo: 1.15 }, normal: { range: 11, expo: 1.1 }, quick: { range: 8.5, expo: 1.15 } };
-  // steering assist: share of the gap to the ideal steering (the computer driver's) that is closed for you
-  const STEER_ASSIST = { off: 0, medium: 0.4, strong: 0.55 };
+  // steering assist (v7): w is the share of the gap to the ideal steering (the computer driver's) that is
+  // closed when you turn less than needed; boost and scrub are the turning help in the physics (extra grip,
+  // and m/s^2 of scrub braking when you steer past the limit, so the car turns instead of running wide)
+  const STEER_ASSIST = { off: { w: 0, boost: 0, scrub: 0 }, medium: { w: 0.4, boost: 0.15, scrub: 6 }, strong: { w: 0.55, boost: 0.22, scrub: 8 } };
   const LINE_MODES = ['full', 'corners', 'off'];
   const CAMS = ['chase', 'near', 'tcam'];
   // how bad each surface is, for picking the worse of the two wheels: asphalt, kerb, painted run-off, grass, gravel
@@ -3797,8 +3820,9 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
       this.prevThr = c0.thr;
       if (t < this.popUntil && t > this.nextPop) { this.burst(0.25 + Math.random() * 0.35, 0.03 + Math.random() * 0.03, 900 + Math.random() * 1400); this.nextPop = t + 0.05 + Math.random() * 0.09; }
       this.whg.gain.setTargetAtTime(0.01 * (0.4 + c0.thr) * (c0.rpm / 12500), t, 0.05);
-      this.sq.gain.setTargetAtTime(v > 8 ? 0.22 * c0.squeal : 0, t, 0.05);
-      this.sqf.frequency.setTargetAtTime(1100 + 400 * c0.squeal, t, 0.05);
+      const sq = Math.max(c0.squeal, 0.5 * (c0.boost || 0));
+      this.sq.gain.setTargetAtTime(v > 8 ? 0.22 * sq : 0, t, 0.05);
+      this.sqf.frequency.setTargetAtTime(1100 + 400 * sq, t, 0.05);
       this.wind.gain.setTargetAtTime((0.1 + 0.04 * (c0.drs || 0)) * Math.min(1, (v / 90) * (v / 90)), t, 0.1);
       const grass = (c0.surfL === 2 ? 0.5 : 0) + (c0.surfR === 2 ? 0.5 : 0);
       const grav = (c0.surfL === 3 ? 0.5 : 0) + (c0.surfR === 3 ? 0.5 : 0);
@@ -3865,6 +3889,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     gx: 0, gy: -1, mag: 0,  // in-plane gravity in the phone's frame (unit vector) and how upright the phone is
     refAngle: -90,          // direction of "down" for the way the phone is held, deg
     raw: 0, angle: 0,       // how far the phone is turned, deg (+ = clockwise = right)
+    drift: 0,               // v7: slow correction of "straight ahead" learned on the straights, deg
     flatFor: 0, flipFor: 0, flatHint: false,
     filter: new OneEuro(3.0, 0.1, 2.0),   // v6: 15-35 ms behind the phone instead of 40-80 ms
   };
@@ -3967,7 +3992,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   const tiltActive = () => settings.steer === 'tilt' && tilt.state === 'on';
   function tiltSteer() {
     const pr = TILT_PRESETS[settings.sens] || TILT_PRESETS.normal;
-    const a = tilt.angle - settings.tiltOffset;
+    const a = tilt.angle - settings.tiltOffset - tilt.drift;
     if (Math.abs(tilt.raw) > 55) return 0;      // the phone is being turned to a new grip, not steered
     const m = clamp((Math.abs(a) - 0.8) / (pr.range - 0.8), 0, 1);
     return -Math.sign(a) * Math.pow(m, pr.expo);
@@ -3980,7 +4005,13 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   }
   // "straight ahead" taken from how the phone is held while the car rolls up to the line
   const centring = { on: false, total: 0, win: 0, n: 0, sum: 0, sum2: 0, done: false, set: false };
-  function startCentring() { Object.assign(centring, { on: tiltActive(), total: 0, win: 0, n: 0, sum: 0, sum2: 0, done: false, set: false }); }
+  function startCentring() { tilt.drift = 0; Object.assign(centring, { on: tiltActive(), total: 0, win: 0, n: 0, sum: 0, sum2: 0, done: false, set: false }); }
+  // where the racing line runs straight for 50 m either side (for re-learning "straight ahead" while driving)
+  const straightRL = (() => {
+    const z = new Uint8Array(N), win = nS(50);
+    for (let i = 0; i < N; i++) { let ok = 1; for (let k = -win; k <= win && ok; k++) if (Math.abs(track.rlK[(i + k + N) % N]) > 1 / 1500) ok = 0; z[i] = ok; }
+    return z;
+  })();
   // true once finished: a steady half second sets the centre, a phone still moving after ~2 s keeps the old one
   function updateCentring(dt) {
     if (!centring.on || centring.done) return true;
@@ -4188,14 +4219,15 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     else steer = touch.hasSteer ? touch.steer : 0;
     // the phone is already smoothed by the tilt filter, so the steering may follow it faster
     car.P.steerRate = tiltNow ? STEER_RATE_TILT : STEER_RATE_TOUCH;
-    // steering assist: closes part of the gap between your steering and the ideal steering. It fades in
-    // and out, and stays out of the way when the car is slow, spun or far from the track.
-    const wantW = (STEER_ASSIST[settings.steerAssist] || 0) * (mode === 'drive' && car.u > 8 && Math.abs(car.n) < track.hw + 7 && Math.abs(car.beta) < 0.35 ? 1 : 0);
+    // steering assist (v7: one-sided). It adds turn when you steer less than the corner needs, never takes
+    // turn away when you steer more, and only nudges you back toward the line when you are hardly steering
+    // against it. It fades in and out, and stays out of the way when the car is slow, spun or far off.
+    const sa = STEER_ASSIST[settings.steerAssist] || STEER_ASSIST.off;
+    const wantW = sa.w * (mode === 'drive' && car.u > 8 && Math.abs(car.n) < track.hw + 7 && Math.abs(car.beta) < 0.35 ? 1 : 0);
     steerAssistW += clamp(wantW - steerAssistW, -dt * 2.5, dt * 2.5);
-    if (steerAssistW > 0.002) {
-      const ideal = assistPilot.inputs(car).steer;
-      steer = clamp(steer + steerAssistW * (ideal - steer), -1, 1);
-    }
+    if (steerAssistW > 0.002) steer = clamp(assistSteer(steer, assistPilot.inputs(car).steer, steerAssistW), -1, 1);
+    // turning help in the physics: steering past the grip limit scrubs speed and adds a little grip
+    car.P.gripBoost = sa.boost; car.P.scrubBrake = sa.scrub;
     let thr = Math.max(touch.thr, keys.up ? 1 : 0);
     const brk = Math.max(touch.brk, keys.down ? 1 : 0);
     let brake = brk;
@@ -4213,6 +4245,10 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   }
   const assistProfile = track.brakingProfile(0.9, 0.82);
   let assistBraking = false, steerAssistW = 0;
+  function assistSteer(p, ideal, w) {
+    if (ideal * p >= 0) return Math.abs(ideal) > Math.abs(p) ? p + w * (ideal - p) : p;   // help, never cut
+    return p + w * Math.max(0, 1 - Math.abs(p) / 0.25) * (ideal - p);                       // light steering against the line
+  }
 
   // ------------------------------------------------------------------ HUD
   const el = {
@@ -4406,6 +4442,8 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     if (kn !== lastKnob) { el.knob.style.transform = kn; lastKnob = kn; }
     const wh = 'rotate(' + (-car.steer * 110).toFixed(0) + 'deg)';
     if (wh !== lastWheel) { el.wheel.style.transform = wh; lastWheel = wh; }
+    const scrub = car.boost > 0.5 && mode === 'drive';
+    if (shown.scrub !== scrub) { el.wheel.classList.toggle('is-scrub', scrub); shown.scrub = scrub; }
     const fb = 'scaleY(' + car.brk.toFixed(2) + ')', ft = 'scaleY(' + car.thr.toFixed(2) + ')';
     if (fb !== lastFb) { el.fBrake.style.transform = fb; lastFb = fb; }
     if (ft !== lastFt) { el.fThrottle.style.transform = ft; lastFt = ft; }
@@ -4960,9 +4998,9 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     if (el.hud.className !== cls) { el.hud.className = cls; ptrs.clear(); syncTouch(); measure(); }
   }
   const STEER_ASSIST_NOTES = {
-    off: 'All the steering is yours.',
-    medium: 'Nudges your steering toward the ideal line. You stay in charge.',
-    strong: 'Corrects more of each mistake. Good while learning the track.',
+    off: 'All the steering is yours. Too fast for a corner and the car runs wide.',
+    medium: 'Adds turn when you need more and never takes it away. Steer past the limit and the tyres find extra grip, scrubbing off a little speed.',
+    strong: 'More help and more turning grip. Good while learning the track.',
   };
   function applySettings() {
     racingLine.visible = settings.line === 'full';
@@ -4992,6 +5030,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   el.tGhost.addEventListener('click', () => { settings.ghost = !settings.ghost; applySettings(); saveStore(); });
   el.tSound.addEventListener('click', () => { settings.sound = !settings.sound; if (settings.sound) audio.start(true); applySettings(); saveStore(); });
   $('btnCentre').addEventListener('click', () => {
+    tilt.drift = 0;
     settings.tiltOffset = Math.abs(tilt.angle) < 1 ? 0 : Math.round(clamp(tilt.angle, -25, 25) * 10) / 10;
     renderMenu(); saveStore();
   });
@@ -5308,6 +5347,7 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
   function step() {
     prev.x = car.x; prev.y = car.y; prev.psi = car.psi;
     const auto = mode === 'title' || DEBUG_AUTO;
+    if (auto) { car.P.gripBoost = 0; car.P.scrubBrake = 0; }
     const inp = auto ? pilot.inputs(car) : readInputs(DT);
     lastInput = inp;
     car.step(DT, inp);
@@ -5339,6 +5379,10 @@ window.TRACK_DATA = {"name":"Hungaroring","length":4381.0,"ds":2.005034324942791
     // treat it as a new grip and measure from the new "down"
     tilt.flipFor = Math.abs(tilt.raw) > 55 ? tilt.flipFor + dt : 0;
     if (tilt.flipFor > 0.4) { tilt.flipFor = 0; rotKey = ''; applyRotation(wantedRotation()); pickReference(); }
+    // v7: hands drift. On a straight at speed, a small steady lean that isn't steering the car anywhere is
+    // taken as the new "straight ahead", slowly (4 s), within 5 degrees of the one set at the start
+    const rel = tilt.angle - settings.tiltOffset - tilt.drift;
+    if (straightRL[car.idx] && car.v > 30 && Math.abs(rel) < 3 && Math.abs(car.steer) < 0.25) tilt.drift = clamp(tilt.drift + rel * dt / 4, -5, 5);
   }
 
   const tiltStateText = () => 'ON' + (tilt.rate >= 1 ? ' · ' + Math.round(tilt.rate) + ' Hz' : '') + (tilt.source === 'motion' ? ' · motion sensor' : '');
